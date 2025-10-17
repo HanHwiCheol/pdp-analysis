@@ -1,22 +1,7 @@
-// app/api/events/route.ts
-import { NextResponse } from 'next/server';
-import { createClient } from '@supabase/supabase-js';
+import { NextRequest, NextResponse } from 'next/server'
+import { createClient } from '@supabase/supabase-js'
 
-/** ====== 타입 ====== */
-type Row = {
-  user_email: string | null;
-  treetable_id: string | null;
-  step: string | null;
-  action: string | null;
-  detail: any;
-  created_at: string;
-  next_created_at: string | null;
-  duration_seconds_to_next: number | null;
-  prev_step: string | null;
-  next_step: string | null;
-};
-
-/** ====== Step → Phase 매핑 ====== */
+/** Step → Phase 매핑 (필요 시 확장) */
 const PHASE_MAP: Record<string, string> = {
   LOGIN: 'Preparation',
   EBOM: 'Preparation',
@@ -26,197 +11,171 @@ const PHASE_MAP: Record<string, string> = {
   'CHECK List': 'Verification',
   'STAGE Change': 'Stage/Finish',
   'PROCESS END': 'Stage/Finish',
-};
-const PHASES = ['Preparation', 'Design', 'Integration', 'Verification', 'Stage/Finish', 'Other'] as const;
+}
+const mapStepToPhase = (step?: string | null) => PHASE_MAP[step ?? ''] ?? 'Other'
 
-const toNum = (v: any, d = 0) => (typeof v === 'number' && isFinite(v) ? v : d);
-const phaseOf = (step?: string | null, action?: string | null) => {
-  const s = (step ?? '').trim();
-  if (s in PHASE_MAP) return PHASE_MAP[s as keyof typeof PHASE_MAP];
-  // Import 같은 키워드가 step/action에 있으면 Integration으로 분류
-  const a = (action ?? '').toLowerCase();
-  if (s.toLowerCase().includes('import') || a.includes('import')) return 'Integration';
-  return 'Other';
-};
-
-/** ====== Supabase 클라이언트 (As-Is / To-Be) ====== */
 function getClient(kind: 'asis' | 'tobe') {
   const url =
-    kind === 'asis' ? process.env.NEXT_PUBLIC_SUPABASE_ASIS_URL : process.env.NEXT_PUBLIC_SUPABASE_TOBE_URL;
+    kind === 'asis' ? process.env.NEXT_PUBLIC_SUPABASE_ASIS_URL : process.env.NEXT_PUBLIC_SUPABASE_TOBE_URL
   const key =
-    kind === 'asis' ? process.env.NEXT_PUBLIC_SUPABASE_ASIS_ANON_KEY : process.env.NEXT_PUBLIC_SUPABASE_TOBE_ANON_KEY;
-  if (!url) throw new Error(`supabase url missing for ${kind}`);
-  if (!key) throw new Error(`supabase key missing for ${kind}`);
-  return createClient(url, key, { db: { schema: 'app' } });
+    kind === 'asis'
+      ? process.env.NEXT_PUBLIC_SUPABASE_ASIS_ANON_KEY
+      : process.env.NEXT_PUBLIC_SUPABASE_TOBE_ANON_KEY
+  if (!url) throw new Error(`supabase url missing for ${kind}`)
+  if (!key) throw new Error(`supabase key missing for ${kind}`)
+  return createClient(url, key, { db: { schema: 'app' } })
 }
 
-/** ====== 되돌림(action 재방문) 계산 ====== */
-// action 문자열 정규화
-const normAction = (a?: string | null) => (a ?? '').trim().toLowerCase();
-
-/** 같은 사용자 시퀀스에서 "동일 action"을 다시 수행한 횟수
- *  (연속 중복 로그는 노이즈로 간주하고 제외)
- *  rows: 반드시 같은 user, created_at 오름차순이어야 함
- */
-function countRevisitsByActionNonConsecutive(rows: Row[]): number {
-  const seen = new Set<string>();
-  let cnt = 0;
-  let prev = '';
-
-  for (const r of rows) {
-    const a = normAction(r.action);
-    if (!a) continue;
-
-    // 직전 이벤트와 동일 action이면 스킵 (연속 중복 제거)
-    if (a === prev) continue;
-
-    if (seen.has(a)) cnt += 1; // 이전에 등장했던 action을 다시 수행 → 재방문
-    seen.add(a);
-    prev = a;
-  }
-  return cnt;
-}
-
-/** ====== 사용자 요약 ====== */
-function buildUserSummary(rows: Row[]) {
-  const byStep: Record<string, { sum: number; n: number }> = {};
-  let totalSec = 0;
-
-  rows.forEach((r) => {
-    const s = toNum(r.duration_seconds_to_next);
-    totalSec += s;
-    const step = r.step ?? 'Unknown';
-    byStep[step] ??= { sum: 0, n: 0 };
-    byStep[step].sum += s;
-    byStep[step].n += 1;
-  });
-
-  const stepAvgSec: Record<string, number> = {};
-  for (const [k, v] of Object.entries(byStep)) {
-    stepAvgSec[k] = v.sum / Math.max(1, v.n);
-  }
-
-  // ✅ 되돌림은 action 재방문(연속중복 무시) 기준
-  const backtracks = countRevisitsByActionNonConsecutive(rows);
-
-  return {
-    email: rows[0]?.user_email ?? '',
-    totalMin: totalSec / 60,
-    backtracks, // KPI
-    stepAvgSec, // 각 step 평균(초)
-  };
-}
-
-/** ====== Phase Summary: As-Is/To-Be 병합 ====== */
-function buildPhaseSummaryMerged(asisRows: Row[], tobeRows: Row[]) {
-  const fold = (rows: Row[]) => {
-    const acc: Record<string, { sum: number; n: number }> = {};
-    rows.forEach((r) => {
-      const ph = phaseOf(r.step, r.action);
-      const sec = toNum(r.duration_seconds_to_next);
-      acc[ph] ??= { sum: 0, n: 0 };
-      acc[ph].sum += sec;
-      acc[ph].n += 1;
-    });
-    const out: Record<string, number> = {};
-    const phases = new Set<string>([...Object.keys(acc), ...PHASES as unknown as string[]]);
-    phases.forEach((p) => {
-      const v = acc[p];
-      out[p] = v ? v.sum / Math.max(1, v.n) / 60 : 0; // 분
-    });
-    return out;
-  };
-
-  const a = fold(asisRows);
-  const t = fold(tobeRows);
-  const union = Array.from(new Set([...Object.keys(a), ...Object.keys(t)]));
-  return union.map((phase) => ({
-    phase,
-    asisMin: a[phase] ?? 0,
-    tobeMin: t[phase] ?? 0,
-  }));
-}
-
-/** ====== Timeline (간단 Gantt) ====== */
-function buildTimelines(rows: Row[]) {
-  const byUser = new Map<string, Row[]>();
-  rows.forEach((r) => {
-    const key = r.user_email ?? 'unknown';
-    (byUser.get(key)?.push(r)) ?? byUser.set(key, [r]);
-  });
-
-  return Array.from(byUser.entries()).map(([user, list]) => {
-    list.sort((a, b) => new Date(a.created_at).getTime() - new Date(b.created_at).getTime());
-    return {
-      user,
-      items: list.map((i) => ({
-        start: i.created_at,
-        end: i.next_created_at ?? i.created_at,
-        step: i.step ?? 'Unknown',
-        phase: phaseOf(i.step, i.action),
-        sec: toNum(i.duration_seconds_to_next),
-      })),
-    };
-  });
-}
-
-/** ====== 메인 핸들러 ====== */
-export async function GET(req: Request) {
+export async function GET(req: NextRequest) {
   try {
-    const { searchParams } = new URL(req.url);
-    const from = searchParams.get('from');
-    const to = searchParams.get('to');
-    const user = searchParams.get('user'); // optional
+    const { searchParams } = new URL(req.url)
+    const from = searchParams.get('from')
+    const to = searchParams.get('to')
+    const user = searchParams.get('user') // 이메일 (옵션)
 
-    const p_from = from ? new Date(from).toISOString() : null;
-    const p_to = to ? new Date(to).toISOString() : null;
+    const p_from = from ? new Date(from).toISOString() : null
+    const p_to = to ? new Date(to).toISOString() : null
+    const p_user = user || null
 
-    const asis = getClient('asis');
-    const tobe = getClient('tobe');
+    const asis = getClient('asis')
+    const tobe = getClient('tobe')
 
-    // 병렬 조회
+    // 공용 RPC: app.get_usage_events(p_from, p_to, p_user)
     const [asisRes, tobeRes] = await Promise.all([
-      asis.rpc('get_usage_events', { p_from, p_to, p_user: user ?? null }),
-      tobe.rpc('get_usage_events', { p_from, p_to, p_user: user ?? null }),
-    ]);
+      asis.rpc('get_usage_events', { p_from, p_to, p_user }),
+      tobe.rpc('get_usage_events', { p_from, p_to, p_user }),
+    ])
 
-    if (asisRes.error) return NextResponse.json({ error: asisRes.error.message }, { status: 500 });
-    if (tobeRes.error) return NextResponse.json({ error: tobeRes.error.message }, { status: 500 });
+    if (asisRes.error) throw new Error(`As-Is RPC error: ${asisRes.error.message}`)
+    if (tobeRes.error) throw new Error(`To-Be RPC error: ${tobeRes.error.message}`)
 
-    const rowsAsIs: Row[] = (asisRes.data ?? []) as Row[];
-    const rowsToBe: Row[] = (tobeRes.data ?? []) as Row[];
+    type Row = {
+      user_email: string
+      step: string | null
+      action: string | null
+      detail: string | null
+      created_at: string
+      next_created_at: string | null
+      duration_seconds_to_next: number | null
+      prev_step: string | null
+      next_step: string | null
+    }
 
-    // 사용자별 요약
+    const rowsAsIs: Row[] = (asisRes.data ?? []) as Row[]
+    const rowsToBe: Row[] = (tobeRes.data ?? []) as Row[]
+
+    // 사용자 목록 (하단 목록 대체 → 상단 드롭다운에 사용)
+    const users = Array.from(
+      new Set([
+        ...rowsAsIs.map((r) => r.user_email).filter(Boolean),
+        ...rowsToBe.map((r) => r.user_email).filter(Boolean),
+      ])
+    ).sort()
+
+
+
+    // 요약 도우미
+    const buildUserSummary = (rows: Row[]) => {
+      // 시간순 정렬
+      const list = [...rows].sort((a, b) => new Date(a.created_at).getTime() - new Date(b.created_at).getTime())
+
+      const totalSec = list.reduce((acc, r) => acc + (r.duration_seconds_to_next ?? 0), 0)
+      // SQL (seen_before > 0)와 동일한 의미:
+      // 같은 step이 이미 한 번이라도 등장했다면 1로 카운트
+      const seenByStep = new Map<string, number>();
+      let backtracks = 0;
+      for (const r of list) {
+        const stepKey = (r.step ?? 'Other').toString();
+        const seen = seenByStep.get(stepKey) ?? 0;
+        if (seen > 0) backtracks += 1;   // 재등장 → backtrack +1
+        seenByStep.set(stepKey, seen + 1);
+      }
+      const stepBuckets: Record<string, { sum: number; n: number }> = {}
+      list.forEach((r) => {
+        const key = r.step ?? 'Other'
+        stepBuckets[key] ??= { sum: 0, n: 0 }
+        stepBuckets[key].sum += r.duration_seconds_to_next ?? 0
+        stepBuckets[key].n += 1
+      })
+      const stepAvgSec: Record<string, number> = Object.fromEntries(
+        Object.entries(stepBuckets).map(([k, v]) => [k, v.sum / Math.max(1, v.n)])
+      )
+      return {
+        email: list[0]?.user_email ?? 'unknown',
+        totalMin: totalSec / 60,
+        backtracks,
+        stepAvgSec,
+      }
+    }
+
     const summarizeByUser = (rows: Row[]) => {
-      const byUser = new Map<string, Row[]>();
+      const byUser = new Map<string, Row[]>()
       rows.forEach((r) => {
-        const key = r.user_email ?? 'unknown';
-        (byUser.get(key)?.push(r)) ?? byUser.set(key, [r]);
-      });
-      // 시간순 정렬 후 요약
-      return Array.from(byUser.values()).map((list) => {
-        list.sort((a, b) => new Date(a.created_at).getTime() - new Date(b.created_at).getTime());
-        return buildUserSummary(list);
-      });
-    };
+        const key = r.user_email ?? 'unknown'
+          ; (byUser.get(key)?.push(r)) ?? byUser.set(key, [r])
+      })
+      return Array.from(byUser.values()).map((list) => buildUserSummary(list))
+    }
 
-    const asisSummary = summarizeByUser(rowsAsIs);
-    const tobeSummary = summarizeByUser(rowsToBe);
+    // 사용자 지정이 들어오면 해당 사용자만 필터링
+    const filterByUser = (rows: Row[]) => (p_user ? rows.filter((r) => r.user_email === p_user) : rows)
 
-    const phaseSummary = buildPhaseSummaryMerged(rowsAsIs, rowsToBe);
-    const timelinesAsIs = buildTimelines(rowsAsIs);
-    const timelinesToBe = buildTimelines(rowsToBe);
+    const asisFiltered = filterByUser(rowsAsIs)
+    const tobeFiltered = filterByUser(rowsToBe)
+
+    const asisSummary = summarizeByUser(asisFiltered)
+    const tobeSummary = summarizeByUser(tobeFiltered)
+
+    // 페이즈 요약 (As-Is / To-Be 각각 합을 계산)
+    const phaseAgg: Record<string, { asis: number; tobe: number }> = {}
+    asisFiltered.forEach((r) => {
+      const phase = mapStepToPhase(r.step)
+      phaseAgg[phase] ??= { asis: 0, tobe: 0 }
+      phaseAgg[phase].asis += (r.duration_seconds_to_next ?? 0) / 60
+    })
+    tobeFiltered.forEach((r) => {
+      const phase = mapStepToPhase(r.step)
+      phaseAgg[phase] ??= { asis: 0, tobe: 0 }
+      phaseAgg[phase].tobe += (r.duration_seconds_to_next ?? 0) / 60
+    })
+    const phaseSummary = Object.entries(phaseAgg).map(([phase, v]) => ({
+      phase,
+      asisMin: v.asis,
+      tobeMin: v.tobe,
+    }))
+
+    // 타임라인 (프런트의 호환성을 위해 As-Is를 기본으로 유지)
+    const timelinesAsIs = asisFiltered.map((r) => ({
+      email: r.user_email,
+      step: r.step,
+      action: r.action,
+      detail: r.detail,
+      at: r.created_at,
+      nextAt: r.next_created_at,
+      durationMin: (r.duration_seconds_to_next ?? 0) / 60,
+    }))
+
+    const timelinesToBe = tobeFiltered.map((r) => ({
+      email: r.user_email,
+      step: r.step,
+      action: r.action,
+      detail: r.detail,
+      at: r.created_at,
+      nextAt: r.next_created_at,
+      durationMin: (r.duration_seconds_to_next ?? 0) / 60,
+    }))
 
     return NextResponse.json({
+      users,
       asisSummary,
       tobeSummary,
       phaseSummary,
-      timelines: timelinesAsIs, // 호환성: 기본은 As-Is
+      timelines: timelinesAsIs,
       timelinesAsIs,
       timelinesToBe,
-    });
+    })
   } catch (e: any) {
-    console.error(e);
-    return NextResponse.json({ error: String(e?.message ?? e) }, { status: 500 });
+    console.error(e)
+    return NextResponse.json({ error: String(e?.message ?? e) }, { status: 500 })
   }
 }
